@@ -203,7 +203,7 @@ The table summarizes where the Gafaelfawr design follows PyPI and where it diffe
      - Repository (with pinned ``repository_id`` and ``repository_owner_id``), optional workflow, optional environment, optional ref
    * - Exchange endpoint
      - ``POST /_/oidc/mint-token`` with ``{"token": "<jwt>"}``
-     - A new Gafaelfawr endpoint; two candidate shapes are described later
+     - ``POST /auth/api/v1/github/token`` using the OAuth 2.0 token exchange grammar of RFC 8693
    * - Minted credential
      - A ``pypi-`` API token valid for 15 minutes, scoped to the matching projects
      - A Gafaelfawr token of type ``github`` for the configured bot user, with configured scopes and a lifetime up to the configured maximum
@@ -416,12 +416,12 @@ The exchange endpoint is the only new route a workflow calls.
 It is unauthenticated in Gafaelfawr's usual sense: no Gafaelfawr token is presented, because the GitHub ID token is the credential.
 It is served directly by Gafaelfawr, like the rest of ``/auth/api/v1``, and is enabled only when ``config.github.tokenExchange.enabled`` is true.
 
-The endpoint lives at ``POST /auth/api/v1/github/token``.
-Two shapes for its request and response are described below.
-Both carry the same information and are processed identically; the choice between them is a decision for review and is listed under open questions.
+The endpoint lives at ``POST /auth/api/v1/github/token`` and follows the OAuth 2.0 token exchange grammar of RFC 8693.
+Gafaelfawr already uses standard interfaces where it talks to third-party software, and this endpoint is consumed by GitHub-hosted tooling rather than by Gafaelfawr's own clients, so the standard grammar is preferred over a Gafaelfawr-specific JSON shape.
+That alternative is described at the end of this section.
 
-Option A: OAuth 2.0 token exchange (RFC 8693)
----------------------------------------------
+Request and response
+--------------------
 
 RFC 8693 defines a standard grammar for trading one security token for another.
 The request is form-encoded, as for every OAuth 2.0 token endpoint:
@@ -436,9 +436,14 @@ The request is form-encoded, as for every OAuth 2.0 token endpoint:
    &subject_token_type=urn:ietf:params:oauth:token-type:id_token
    &scope=write:docverse
 
-The ``scope`` parameter is optional and narrows the scopes to a subset of what the matching project allows.
-RFC 8693 defines no parameter for the requested lifetime, so lifetime narrowing would need a non-standard parameter (for example ``lifetime=1800``) or would be unavailable in this shape.
-A successful response follows RFC 6749 and RFC 8693:
+``grant_type`` and ``subject_token_type`` must have exactly the values shown; any other value is rejected.
+``subject_token`` is the GitHub ID token.
+The ``scope`` parameter is optional and, as in RFC 6749, is a space-separated list; when present it narrows the scopes to a subset of what the matching project allows, and when absent the token receives the project's full scope list.
+RFC 8693 defines no parameter for the requested lifetime, so the minted token always receives the project's ``max_lifetime``.
+Per-request lifetime narrowing has no use case among the motivating services, and if one appears, OAuth 2.0 permits extension parameters, so a ``lifetime`` parameter in seconds could be added without leaving the standard framing.
+The other RFC 8693 parameters, ``resource``, ``audience``, ``requested_token_type``, ``actor_token``, and ``actor_token_type``, are not used and are rejected if present, so that a client cannot believe it has asked for something the endpoint silently ignored.
+
+A successful response is ``200 OK`` and follows RFC 6749 and RFC 8693:
 
 .. code-block:: json
 
@@ -450,49 +455,22 @@ A successful response follows RFC 6749 and RFC 8693:
      "scope": "write:docverse"
    }
 
-Errors use the OAuth 2.0 error document with HTTP 400: ``invalid_request`` for a malformed request, ``invalid_grant`` for an ID token that fails verification or matches no project, and ``invalid_scope`` for a scope the project does not allow.
-Each carries an ``error_description`` with a human-readable reason.
+``access_token`` is the Gafaelfawr token, ``expires_in`` is its remaining lifetime in seconds, and ``scope`` is the space-separated list of scopes it carries.
+The response carries nothing Gafaelfawr-specific, such as the bot username or the matched project; a workflow does not need them, and the audit trail records both.
+As RFC 6749 requires, the response is sent with ``Cache-Control: no-store``.
 
-The case for this shape is familiarity.
-Reviewers and future maintainers can read the RFC instead of a Gafaelfawr-specific description, the error vocabulary is already defined, and the pattern matches how cloud providers consume GitHub ID tokens.
-The case against is that no client library is needed either way (a workflow issues one HTTP POST), the form encoding and URN-valued parameters are noisier than JSON for a bespoke endpoint, and Gafaelfawr's existing API is JSON throughout.
+Errors use the OAuth 2.0 error document with HTTP 400: ``invalid_request`` for a malformed request, including an unsupported ``grant_type`` or ``subject_token_type``; ``invalid_grant`` for an ID token that fails verification or matches no enabled project; and ``invalid_scope`` for a scope the project does not allow.
+Each carries an ``error_description`` with a human-readable reason that a workflow author can act on.
+Gafaelfawr's OpenID Connect server already implements this error document for its own token endpoint, so the error handling can be shared.
 
-Option B: JSON request and response
------------------------------------
-
-The second shape follows PyPI's mint-token endpoint and Gafaelfawr's own API conventions:
-
-.. code-block:: json
-
-   {
-     "token": "eyJhbGciOiJSUzI1NiIs...",
-     "scopes": ["write:docverse"],
-     "lifetime": "PT30M"
-   }
-
-``scopes`` and ``lifetime`` are optional.
-When omitted, the token receives the project's full scope list and maximum lifetime.
-The response is ``201 Created``:
-
-.. code-block:: json
-
-   {
-     "token": "gt-vHj2M...",
-     "username": "bot-gh-docverse-sqr-062",
-     "scopes": ["write:docverse"],
-     "expires": "2026-10-28T19:03:11Z",
-     "project": 14
-   }
-
-Errors use Gafaelfawr's existing error format, a ``detail`` list whose entries carry a ``type`` such as ``invalid_token``, ``no_matching_project``, or ``invalid_scopes``, with HTTP 400 for malformed requests, 401 for an ID token that fails verification, and 403 for a verified token that matches no enabled project or requests scopes it is not allowed.
-
-The case for this shape is consistency with the rest of Gafaelfawr's API and with PyPI, the model most contributors already know; the response can also carry useful context such as the bot username and the ID of the matched project.
-The case against is that it is one more bespoke token API.
+The alternative considered was a JSON request and response in the style of PyPI's mint-token endpoint and the rest of Gafaelfawr's ``/auth/api/v1`` routes: a body of ``{"token": "<jwt>", "scopes": [...]}`` answered with ``201 Created`` and a document carrying the token, the bot username, the scopes, the expiration time, and the matched project ID, with errors in Gafaelfawr's ``detail`` format.
+Its advantages were consistency with the rest of the API and a response that could echo the resolved identity.
+Neither outweighs having a documented grammar and error vocabulary that reviewers and future maintainers can read in the RFC instead of in Gafaelfawr's documentation, and that matches how cloud providers consume GitHub ID tokens.
 
 Processing
 ----------
 
-Whichever shape is chosen, the endpoint processes a request in the following steps.
+The endpoint processes a request in the following steps.
 Each failure is logged with the reason and the claims that could be read, so that a workflow author can be helped without seeing Gafaelfawr's logs.
 
 1. Decode the JWT header and read ``kid`` and ``alg``.
@@ -506,7 +484,7 @@ Each failure is logged with the reason and the claims that could be read, so tha
    No match, or an ambiguous match, is a rejection.
 6. Determine the token's scopes and lifetime.
    Requested scopes must be a subset of the project's scopes; a request for a scope outside that set is rejected rather than silently narrowed, so that a misconfigured workflow fails visibly.
-   The lifetime is the requested lifetime if given and no longer than the project's ``max_lifetime``, otherwise the maximum.
+   The lifetime is the project's ``max_lifetime``.
 7. Mint a token of type ``github`` for the project's username with those scopes and that expiration, recording the project's ID on the token, and return it.
 
 The ``github`` token type
@@ -541,7 +519,7 @@ Using the exchange from a workflow
 
 From a workflow author's point of view the exchange is two steps: obtain an ID token from GitHub with the right audience, and post it to Gafaelfawr.
 The job must request the ``id-token: write`` permission, which is best granted at the job level so that other jobs in the workflow cannot mint tokens.
-Using the JSON shape, a shell step looks like this:
+As a shell step, it looks like this:
 
 .. code-block:: yaml
 
@@ -561,8 +539,10 @@ Using the JSON shape, a shell step looks like this:
              id_token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://roundtable.lsst.cloud" | jq -r .value)
              token=$(curl -sSf -X POST https://roundtable.lsst.cloud/auth/api/v1/github/token \
-               -H "Content-Type: application/json" \
-               -d "{\"token\": \"$id_token\", \"scopes\": [\"write:docverse\"]}" | jq -r .token)
+               --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+               --data-urlencode "subject_token_type=urn:ietf:params:oauth:token-type:id_token" \
+               --data-urlencode "subject_token=$id_token" \
+               --data-urlencode "scope=write:docverse" | jq -r .access_token)
              echo "::add-mask::$token"
              echo "token=$token" >> "$GITHUB_OUTPUT"
 
@@ -575,7 +555,7 @@ The ``::add-mask::`` line keeps the minted token out of the job log.
 Nothing in the repository's secrets is used.
 
 Writing this shell by hand in every repository is error-prone, so the exchange should be packaged once.
-The proposal is a composite GitHub Action in the ``lsst-sqre`` organization, provisionally ``lsst-sqre/gafaelfawr-token-action``, that takes the Phalanx environment URL and optional scopes and lifetime as inputs, performs both steps, masks the result, and exposes it as a ``token`` output.
+The proposal is a composite GitHub Action in the ``lsst-sqre`` organization, provisionally ``lsst-sqre/gafaelfawr-token-action``, that takes the Phalanx environment URL and optional scopes as inputs, performs both steps, masks the result, and exposes it as a ``token`` output.
 SQuaRE's existing TypeScript actions that already talk to these services, such as ``docverse-upload``, can also perform the exchange internally using ``@actions/core``'s ``getIDToken()``, so that a workflow needs no separate step at all.
 For Python clients, the ``rubin.gafaelfawr`` client library can gain a helper that performs the exchange when it detects the GitHub Actions environment variables.
 
@@ -698,11 +678,8 @@ Open questions and decisions for review
 =======================================
 
 The following decisions need to be made before implementation starts.
-The first is the only one that changes the external interface; the rest can be settled during review or deferred with a recorded default.
+None changes the external interface, which review has settled on the RFC 8693 token exchange grammar; each can be settled during review or deferred with a recorded default.
 
-- **Endpoint shape.**
-  RFC 8693 token exchange (Shape A) or a JSON request and response (Shape B)?
-  Shape A is standard but has no lifetime parameter; Shape B matches Gafaelfawr's API and PyPI.
 - **Resolving pinned IDs.**
   Should the admin API look up ``repository_id`` and ``repository_owner_id`` through GitHub's public API, require administrators to supply them, or should Gafaelfawr hold a GitHub credential so private repositories can be resolved too?
 - **Overlapping projects.**
@@ -736,7 +713,8 @@ References
 - `About security hardening with OpenID Connect <https://docs.github.com/en/actions/concepts/security/openid-connect>`__: GitHub's conceptual overview.
 - `PyPI trusted publishers: internals and technical details <https://docs.pypi.org/trusted-publishers/internals/>`__: the two-phase exchange and the ``repository_owner_id`` resurrection defense.
 - `PyPI trusted publishers: using a publisher <https://docs.pypi.org/trusted-publishers/using-a-publisher/>`__: the ``/_/oidc/audience`` and ``/_/oidc/mint-token`` endpoints.
-- `RFC 8693: OAuth 2.0 Token Exchange <https://www.rfc-editor.org/rfc/rfc8693>`__: the grammar for Shape A.
+- `RFC 8693: OAuth 2.0 Token Exchange <https://www.rfc-editor.org/rfc/rfc8693>`__: the grammar of the exchange endpoint.
+- `RFC 6749: The OAuth 2.0 Authorization Framework <https://www.rfc-editor.org/rfc/rfc6749>`__: the token response and error document the exchange endpoint follows.
 - `Gafaelfawr: service tokens <https://gafaelfawr.lsst.io/user-guide/service-tokens.html>`__: bot usernames and the ``GafaelfawrServiceToken`` resource.
 - `Gafaelfawr: token administrators <https://gafaelfawr.lsst.io/user-guide/administrators.html>`__: the ``admin:token`` scope and the admin token API.
 - `Gafaelfawr: scopes <https://gafaelfawr.lsst.io/dev/scopes.html>`__: reserved scopes and delegation rules.
