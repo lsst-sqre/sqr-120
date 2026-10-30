@@ -236,6 +236,8 @@ A project binds a set of claim constraints to a bot user and a token policy.
 The bot user follows Gafaelfawr's existing convention for service identities, with a narrower prefix: its username begins with ``bot-gh-``, so that an identity minted from GitHub is recognizable wherever a username appears, and it exists implicitly as the username on the tokens minted for it, so no separate user record is created.
 Gafaelfawr enforces the ``bot-`` prefix only for service tokens created through the admin token API, a path the exchange does not use, so the registry enforces the ``bot-gh-`` prefix itself when a project is created or modified.
 
+In the table, the Required column distinguishes fields the administrator must supply (yes), may supply (no), may omit in favor of a derived value (default), and fields the administrator never supplies: generated fields are set by Gafaelfawr, and pinned fields are looked up from GitHub when the project is created and then compared against the ID token at every exchange.
+
 .. list-table:: Fields of a GitHub project
    :header-rows: 1
    :widths: 18 12 10 60
@@ -303,7 +305,7 @@ Gafaelfawr enforces the ``bot-`` prefix only for service tokens created through 
      - generated
      - Username of the administrator who made the change
 
-The three pinned fields are what make the registry robust against GitHub-side changes.
+The two pinned fields are what make the registry robust against GitHub-side changes.
 A repository can be renamed or transferred, and an organization or user name can be deleted and later re-registered by someone else.
 Because GitHub's numeric IDs never change or get reused, comparing them at exchange time means the trust follows the original repository and owner, not whoever currently holds the name.
 This copies PyPI's defense against account resurrection and extends it to the repository itself.
