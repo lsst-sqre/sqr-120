@@ -5,7 +5,7 @@ GitHub Actions OIDC token exchange in Gafaelfawr
 .. abstract::
 
    This technote proposes a design for authenticating GitHub Actions workflows to Phalanx-deployed services without long-lived secrets.
-   A workflow presents the OpenID Connect (OIDC) ID token that GitHub issues to its job, and Gafaelfawr exchanges it for a short-lived Gafaelfawr token whose scopes and lifetime are set by a registry of trusted GitHub projects.
+   A workflow presents the OpenID Connect (OIDC) ID token that GitHub issues to its job, and Gafaelfawr exchanges it for a short-lived Gafaelfawr token of a new ``github`` type whose scopes and lifetime are set by a registry of trusted GitHub projects.
 
 Introduction
 ============
@@ -20,9 +20,9 @@ The token is short-lived and needs no secret to obtain.
 A service that trusts GitHub's signing keys can verify the token and decide, based on its claims, whether to grant access.
 This is the mechanism behind PyPI's trusted publishers, which lets a workflow publish a package without a stored API token.
 
-This technote proposes a design in which `Gafaelfawr <https://gafaelfawr.lsst.io/>`__, the Rubin Science Platform's authentication and authorization service, accepts a GitHub Actions ID token and exchanges it for a short-lived Gafaelfawr service token.
+This technote proposes a design in which `Gafaelfawr <https://gafaelfawr.lsst.io/>`__, the Rubin Science Platform's authentication and authorization service, accepts a GitHub Actions ID token and exchanges it for a short-lived Gafaelfawr token of a new ``github`` type, minted for a bot user.
 Which repositories may do this, what scopes they receive, and how long the token lives are governed by a registry of GitHub projects stored in Gafaelfawr's database and managed through a new admin API.
-Services behind Gafaelfawr's ingress need no changes: they see an ordinary service token for a bot user.
+Services behind Gafaelfawr's ingress need no changes: they see a bot user's token, which the ingress validates like any other Gafaelfawr token.
 
 The motivating use cases are:
 
@@ -91,7 +91,7 @@ The exchange sequence
        GitHub-->>Gafaelfawr: JWKS
        Note over Gafaelfawr: 4. Verify signature, issuer, audience, validity window
        Note over Gafaelfawr: 5. Match claims against the GitHub project registry
-       Gafaelfawr-->>Job: 6. Short-lived Gafaelfawr service token
+       Gafaelfawr-->>Job: 6. Short-lived Gafaelfawr token of type github
        Job->>Service: 7. Call the service with the Gafaelfawr token
        Service-->>Job: Response (ingress validates the token as usual)
 
@@ -101,9 +101,9 @@ The exchange sequence
 4. Gafaelfawr fetches GitHub's JWKS (caching it between requests), verifies the signature, and checks that the issuer is GitHub, the audience is Gafaelfawr's own base URL, and the token is within its validity window.
 5. Gafaelfawr looks up the token's repository, workflow, environment, and ref claims in its registry of GitHub projects.
    If a project matches, the registry entry gives the bot username, the permitted scopes, and the maximum lifetime.
-6. Gafaelfawr mints a service token for that bot user and returns it to the job.
+6. Gafaelfawr mints a ``github`` token for that bot user and returns it to the job.
 7. The job calls the Phalanx service (Ook, Docverse, and so on) with the Gafaelfawr token in the ``Authorization`` header.
-   The service's ingress validates the token exactly as it validates any other service token; the service itself never sees the GitHub ID token.
+   The service's ingress validates the token exactly as it validates any other Gafaelfawr token; the service itself never sees the GitHub ID token.
 
 The ID token is used exactly once, for step 3, and is never sent to the Phalanx service.
 This two-phase design mirrors PyPI's: the OIDC-specific logic is isolated in one exchange endpoint, and everything downstream keeps working with the token type it already understands.
@@ -206,7 +206,7 @@ The table summarizes where the Gafaelfawr design follows PyPI and where it diffe
      - A new Gafaelfawr endpoint; two candidate shapes are described later
    * - Minted credential
      - A ``pypi-`` API token valid for 15 minutes, scoped to the matching projects
-     - A Gafaelfawr service token for the configured bot user, with configured scopes and a lifetime up to the configured maximum
+     - A Gafaelfawr token of type ``github`` for the configured bot user, with configured scopes and a lifetime up to the configured maximum
    * - Identity downstream
      - Upload permission on the project
      - An ordinary bot user, visible to services as the caller
@@ -233,7 +233,8 @@ Domain model
 
 The unit of configuration is a GitHub project.
 A project binds a set of claim constraints to a bot user and a token policy.
-The bot user follows Gafaelfawr's existing convention for service identities: its username begins with ``bot-``, and it exists implicitly as the username on the tokens minted for it, so no separate user record is created.
+The bot user follows Gafaelfawr's existing convention for service identities, with a narrower prefix: its username begins with ``bot-gh-``, so that an identity minted from GitHub is recognizable wherever a username appears, and it exists implicitly as the username on the tokens minted for it, so no separate user record is created.
+Gafaelfawr enforces the ``bot-`` prefix only for service tokens created through the admin token API, a path the exchange does not use, so the registry enforces the ``bot-gh-`` prefix itself when a project is created or modified.
 
 .. list-table:: Fields of a GitHub project
    :header-rows: 1
@@ -254,7 +255,7 @@ The bot user follows Gafaelfawr's existing convention for service identities: it
    * - ``username``
      - string
      - default
-     - Bot username tokens are minted for; must begin with ``bot-`` and be a valid Gafaelfawr username.
+     - Bot username tokens are minted for; must begin with ``bot-gh-`` and be a valid Gafaelfawr username.
        Defaults to ``bot-gh-<owner>-<repo>`` derived from ``repository`` when omitted.
        Several projects may share one
    * - ``repository``
@@ -292,7 +293,7 @@ The bot user follows Gafaelfawr's existing convention for service identities: it
    * - ``enabled``
      - boolean
      - yes
-     - Disabled projects are kept but never match
+     - Disabled projects are kept but never match; disabling a project revokes its outstanding tokens
    * - ``created``, ``modified``
      - timestamps
      - generated
@@ -372,9 +373,9 @@ Every route requires the ``admin:token`` scope, matching the rule that only toke
    * - ``GET /auth/api/v1/github/projects/{id}``
      - Retrieve one project
    * - ``PATCH /auth/api/v1/github/projects/{id}``
-     - Modify any field except ``repository_id`` and ``repository_owner_id``; changing ``repository`` re-resolves them
+     - Modify any field except ``repository_id`` and ``repository_owner_id``; changing ``repository`` re-resolves them, and setting ``enabled`` to false revokes the project's outstanding tokens
    * - ``DELETE /auth/api/v1/github/projects/{id}``
-     - Delete a project; responds with ``204 No Content``
+     - Delete a project and revoke its outstanding tokens; responds with ``204 No Content``
 
 A request to create a project for Docverse uploads from the SQR-062 repository, restricted to the ``docs.yaml`` workflow on the default branch and on tags:
 
@@ -382,7 +383,7 @@ A request to create a project for Docverse uploads from the SQR-062 repository, 
 
    {
      "description": "Docverse uploads for SQR-062",
-     "username": "bot-docverse-sqr-062",
+     "username": "bot-gh-docverse-sqr-062",
      "repository": "lsst-sqre/sqr-062",
      "workflow": ".github/workflows/docs.yaml",
      "ref": "refs/heads/main",
@@ -393,8 +394,10 @@ A request to create a project for Docverse uploads from the SQR-062 repository, 
 The response echoes the project with the resolved username, ``id``, the pinned ``repository_id`` and ``repository_owner_id``, ``enabled`` defaulting to ``true``, and the audit fields.
 Durations use ISO 8601 (``PT1H``, ``PT15M``) in the API and are stored as seconds.
 
-Deleting a project does not revoke tokens already minted for its bot user; they expire on their own, and an administrator who needs immediate revocation can delete them through the existing ``/auth/api/v1/users/{username}/tokens`` routes.
-Short maximum lifetimes keep that window small.
+Every token the exchange mints records the ID of the project that authorized it, so deleting a project, or disabling it by setting ``enabled`` to false, revokes all of that project's outstanding tokens in the same transaction.
+Each revocation is written to the token change history with the acting administrator as the actor, and the number of tokens revoked is logged.
+Changing a project's other fields, such as its scopes or constraints, does not affect tokens already minted; an administrator who tightens a policy and wants it to take effect at once disables and re-enables the project.
+A single token can still be deleted through the existing ``/auth/api/v1/users/{username}/tokens`` routes.
 
 Registry changes are recorded in a new ``github_project_history`` table in the same style as Gafaelfawr's token change history: each row stores the action (create, modify, delete), the acting administrator, the time, the client IP address, and the before and after values.
 This gives the team the same audit trail for trust configuration that it has for tokens.
@@ -475,7 +478,7 @@ The response is ``201 Created``:
 
    {
      "token": "gt-vHj2M...",
-     "username": "bot-docverse-sqr-062",
+     "username": "bot-gh-docverse-sqr-062",
      "scopes": ["write:docverse"],
      "expires": "2026-10-28T19:03:11Z",
      "project": 14
@@ -504,15 +507,31 @@ Each failure is logged with the reason and the claims that could be read, so tha
 6. Determine the token's scopes and lifetime.
    Requested scopes must be a subset of the project's scopes; a request for a scope outside that set is rejected rather than silently narrowed, so that a misconfigured workflow fails visibly.
    The lifetime is the requested lifetime if given and no longer than the project's ``max_lifetime``, otherwise the maximum.
-7. Mint a service token for the project's username with those scopes and that expiration through the existing token service, and return it.
+7. Mint a token of type ``github`` for the project's username with those scopes and that expiration, recording the project's ID on the token, and return it.
 
-The minted token is an ordinary Gafaelfawr service token.
-It appears in the token admin interfaces under its bot username and can be listed, inspected, and deleted there like any other.
+The ``github`` token type
+-------------------------
+
+The minted token is a Gafaelfawr token of a new type, ``github``, alongside the existing ``session``, ``user``, ``notebook``, ``internal``, ``service``, and ``oidc`` types.
+A distinct type follows the precedent of the ``oidc`` type, which Gafaelfawr introduced for the access tokens issued by its OpenID Connect server because those tokens have different security semantics from the tokens they are derived from.
+Tokens minted from a GitHub ID token differ from service tokens in the same way: they are created without an administrator, by an unattended remote system, on the strength of GitHub's attestation rather than a stored credential.
+Recording that difference in the token type makes these tokens identifiable in the token change history, which can already be filtered by type, and in logs, and it leaves room to treat them differently later without changing the registry or the exchange.
+
+In every other respect a ``github`` token behaves like a service token.
+It carries the same scopes, the ingress validates it the same way, it appears in the token admin interfaces under its bot username and can be listed, inspected, and deleted there, and a service that receives one can delegate internal tokens from it as from any other token.
+Like service and ``oidc`` tokens, it cannot be modified after creation.
+It also cannot be created through the admin token API, whose request model accepts only the ``service`` and ``user`` types; the exchange endpoint is the only way to mint one.
+
+Adding the type to Gafaelfawr requires a one-line database migration, since token types are stored as a PostgreSQL enum, and a token-service method modeled on the one that mints ``oidc`` tokens rather than on the admin token request path.
+The token table gains a nullable column holding the ID of the GitHub project that authorized the token, indexed so that a project's outstanding tokens can be found and revoked when the project is deleted or disabled; the same column is added to the token change history so that a revocation can be traced to its project.
+Both schema changes land in one migration.
+The ``rubin.gafaelfawr`` client library defines its own subset of token types and gains ``github`` if its helpers inspect token information.
 
 Audit trail
 -----------
 
-The token change history records the creation, with the bot username as the actor and the GitHub runner's address as the IP address.
+The token change history records the creation with the ``github`` token type, the project ID, the bot username as the actor, and the GitHub runner's address as the IP address.
+Because the history can be filtered by type through the existing ``token_type`` query parameter on ``/auth/api/v1/history/token-changes``, every token the exchange has ever minted can be listed in one query, and the project ID separates the tokens of projects that share a bot user.
 In addition, the exchange emits a structured log entry and a metrics event carrying the project ID, the bot username, the token key, and the ID token's ``repository``, ``job_workflow_ref``, ``ref``, ``environment``, ``event_name``, ``actor``, ``run_id``, ``run_attempt``, and ``jti``.
 This is enough to answer, for any token, exactly which workflow run obtained it and who triggered that run.
 It also preserves the provenance information that Ook currently derives from the ID token itself.
@@ -630,8 +649,16 @@ Lifetime and revocation
 -----------------------
 
 Minted tokens are capped by the project's ``max_lifetime`` and the environment-wide ceiling.
-Deleting or disabling a project stops new tokens immediately but does not revoke existing ones; administrators revoke those through the existing token routes.
-Short lifetimes, one hour by default, keep the exposure from a leaked token small.
+Deleting or disabling a project revokes every outstanding token minted for it, because each token records its project, so the registry is the one place an administrator needs to act to cut off a repository.
+Short lifetimes, one hour by default, keep the exposure from a leaked token small in the time before anyone acts.
+
+A distinct token type
+---------------------
+
+Because these tokens have their own type, Gafaelfawr could later apply restrictions to them that do not apply to service tokens, for example requiring an ingress to opt in to accepting ``github`` tokens.
+This design does not propose such a restriction.
+The alternative to the exchange is a service token stored as a repository secret and used by the same unattended workflow, so any restriction worth imposing on ``github`` tokens applies equally to service tokens held by automation, and the right fix is to tighten what a token without scopes can do rather than add another authorization mechanism.
+The type keeps the option open at no cost.
 
 .. _user-owned-projects:
 
@@ -645,7 +672,7 @@ This section sketches what that extension requires so that the first phase does 
 
 A user-owned project differs from an admin-owned one in three ways.
 It records an owner, the username of the user who registered it.
-It mints a ``user`` token for that username rather than a ``service`` token for a bot, so the token appears in the owner's token list in the Gafaelfawr UI and can be revoked there, and it carries the owner's uid, gid, and groups like any other user token.
+It mints a ``user`` token for that username rather than a ``github`` token for a bot, so the token appears in the owner's token list in the Gafaelfawr UI and can be revoked there, and it carries the owner's uid, gid, and groups like any other user token; whether such tokens should instead keep the ``github`` type, and lose that integration, is a question for that phase.
 Its scopes are bounded by what the owner is entitled to rather than by what an administrator configured: the owner may choose any subset of the scopes their session holds when registering, mirroring the rule for user tokens, and at exchange time Gafaelfawr re-derives the owner's current scopes from group membership and intersects them with the project's scopes, so that a user removed from a data-rights group stops receiving tokens.
 
 Registration would be self-service through routes under ``/auth/api/v1/users/{username}/github-projects``, authorized by the ``user:token`` scope, with a panel in the token UI beside the existing user-token form.
@@ -713,4 +740,4 @@ References
 - `Gafaelfawr: service tokens <https://gafaelfawr.lsst.io/user-guide/service-tokens.html>`__: bot usernames and the ``GafaelfawrServiceToken`` resource.
 - `Gafaelfawr: token administrators <https://gafaelfawr.lsst.io/user-guide/administrators.html>`__: the ``admin:token`` scope and the admin token API.
 - `Gafaelfawr: scopes <https://gafaelfawr.lsst.io/dev/scopes.html>`__: reserved scopes and delegation rules.
-- `Gafaelfawr: token types <https://gafaelfawr.lsst.io/dev/internals/gafaelfawr.models.enums.TokenType.html>`__: the ``service`` token type reused by this design.
+- `Gafaelfawr: token types <https://gafaelfawr.lsst.io/dev/internals/gafaelfawr.models.enums.TokenType.html>`__: the existing token types, including the ``oidc`` type that is the precedent for the ``github`` type proposed here.
