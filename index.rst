@@ -12,7 +12,7 @@ Introduction
 
 GitHub Actions workflows increasingly need to call services deployed on Phalanx.
 Today the only way for a workflow to authenticate is a long-lived Gafaelfawr token created by an administrator and stored as a GitHub Actions secret.
-Such secrets have well-known problems: they do not expire unless someone remembers to rotate them, they are not bound to the workflow that is supposed to use them, anyone with write access to the repository's secrets can exfiltrate them, and provisioning one for every new repository (or organization) is a manual chore for the SQuaRE team.
+Such secrets have well-known problems: they do not expire unless someone remembers to rotate them, they are not bound to the workflow that is supposed to use them, anyone who can run a workflow in the repository can exfiltrate them, and provisioning one for every new repository (or organization) is a manual chore for the SQuaRE team.
 
 GitHub Actions offers an alternative.
 Every job can request a signed OpenID Connect (OIDC) ID token from GitHub that attests which repository, workflow file, git ref, and GitHub environment the job is running in.
@@ -394,7 +394,7 @@ A request to create a project for Docverse uploads from the SQR-062 repository, 
    }
 
 The response echoes the project with the resolved username, ``id``, the pinned ``repository_id`` and ``repository_owner_id``, ``enabled`` defaulting to ``true``, and the audit fields.
-Durations use ISO 8601 (``PT1H``, ``PT15M``) in the API and are stored as seconds.
+In requests, durations are accepted as a number of seconds or as an ISO 8601 duration (``PT1H``, ``PT15M``), as Pydantic's duration validation allows; responses always use ISO 8601, and durations are stored as seconds.
 
 Every token the exchange mints records the ID of the project that authorized it, so deleting a project, or disabling it by setting ``enabled`` to false, revokes all of that project's outstanding tokens in the same transaction.
 Each revocation is written to the token change history with the acting administrator as the actor, and the number of tokens revoked is logged.
@@ -479,7 +479,7 @@ Each failure is logged with the reason and the claims that could be read, so tha
    Reject anything but an asymmetric algorithm GitHub uses (``RS256``).
 2. Load GitHub's JWKS from the URL in its OpenID configuration document, from a cache with the configured lifetime.
    If ``kid`` is not in the cached set, refresh the cache once before failing, since GitHub rotates keys.
-3. Verify the signature, then check that ``iss`` is ``https://token.actions.githubusercontent.com``, that ``aud`` equals the configured audience, and that the current time is within ``nbf`` and ``exp``, allowing a small clock skew.
+3. Verify the signature, then check that ``iss`` is ``https://token.actions.githubusercontent.com``, that ``aud`` equals the configured audience, that the current time is not before ``nbf``, allowing a small clock skew, and that it is strictly before ``exp``.
 4. Read the claims the registry needs: ``repository``, ``repository_id``, ``repository_owner_id``, ``job_workflow_ref``, ``ref``, and, if present, ``environment``.
    A token missing any required claim is rejected.
 5. Find the enabled projects for that repository and evaluate the matching rules, selecting the most specific match.
