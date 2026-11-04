@@ -739,6 +739,7 @@ Like the registry, the provisioning route exists per Phalanx environment, and a 
 Templatebot's token is issued by Roundtable, where Docverse and Ook run, so documentation projects can be provisioned there.
 Notebook technotes additionally need a project in a Rubin Science Platform environment for Noteburst, and Templatebot has no token in those environments.
 In the first phase those projects are registered by hand, which is acceptable for the small number of notebook technotes.
+This means that creating a notebook technote from Slack is not fully automated: the documentation project in Roundtable is provisioned by Templatebot, but an administrator must still register the Noteburst project before the notebook can execute, and Templatebot should say so in its reply to the requester.
 If that becomes a burden, an administrator can issue Templatebot a service token in the RSP environment carrying only ``admin:github-oidc-provision`` and store it in Templatebot's Vault secrets.
 The narrow scope makes that a tolerable long-lived secret in a way that an ``admin:token`` service token would not be.
 
