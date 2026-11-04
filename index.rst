@@ -672,7 +672,7 @@ Future work: user-owned projects
 The design above serves SQuaRE's own services, with trust configured by administrators and tokens minted for bot users.
 The same exchange could let a Rubin Science Platform user register a repository themselves and have workflows in it obtain tokens under their own account, so that a GitHub Actions job can, for example, run a TAP query and render a figure for a paper draft.
 Because the token would be the user's, the compute is charged against their quota and their data rights apply, exactly as if they had created the token by hand.
-This section sketches what that extension requires so that the first phase does not preclude it; it is not part of the proposal under review.
+This section sketches the extension and the questions it raises; it is not part of the proposal under review.
 
 A user-owned project differs from an admin-owned one in three ways.
 It records an owner, the username of the user who registered it.
@@ -688,15 +688,22 @@ In environments whose identity source is LDAP, such as ``data.lsst.cloud`` and U
 In GitHub-authenticated environments such as Roundtable, group membership exists only inside session token data, so there is nothing to consult and user-owned projects cannot be offered.
 Since science users live in the RSP environments, this restriction costs nothing for the motivating use case.
 
-Two questions are new rather than inherited from the first phase.
-First, several users may register the same repository, and the exchange cannot guess which one a workflow run means, so the exchange request gains an optional ``username`` parameter and a user-owned project matches on repository and owner together.
-Second, a user can register a repository they do not control.
-This harms nobody but themselves, but the converse must be stated plainly in the UI: registering a repository means that anyone who can run workflows in it can act as that user on the platform with the chosen scopes.
-The defaults should therefore restrict the ref to the repository's default branch and keep the lifetime short, and the user's ability to see and revoke the resulting tokens is the backstop.
-Verifying that the user controls the repository is hard to do well when the platform identity is not a GitHub identity, so trust at registration with a clear warning is the likely outcome.
+The security model of this extension is not settled, and two problems in it are new rather than inherited from the first phase.
 
-To keep this phase additive, the first phase should include the nullable ``owner`` column in the project table and accept an optional ``username`` parameter on the exchange request, ignored when no user-owned projects exist.
-Everything else, the user-facing routes, the UI, the group lookup at exchange time, and the environment setting, can be added later without changing the admin-owned flow.
+First, a user can register a repository they do not control, and nothing in the first phase lets Gafaelfawr check the claim, since a platform identity is not a GitHub identity.
+Registering a repository means that anyone who can run a workflow in it can act as the registering user on the platform with the chosen scopes.
+The user bears the consequences, but so does the project: abuse of a science user's credentials consumes platform resources and can expose data the user has rights to, so the platform cannot simply let users accept the risk on their own behalf.
+A registration therefore needs proof of control before it is trusted.
+One workable form is a challenge: Gafaelfawr issues a nonce for a pending project, and the user must make a workflow in the repository present an ID token whose exchange request carries that nonce, which proves that the registrant can run workflows there.
+Another is to limit user-owned projects to repositories under GitHub owners the platform already associates with the user, which is possible only where GitHub is the identity provider.
+
+Second, several users may register the same repository.
+Adding a ``username`` parameter to the exchange request so that a workflow can say which owner it means does not resolve this: it lets any workflow in the repository choose any of the registered users, so each registrant can be impersonated by whoever else can run workflows there.
+Proof of control at registration narrows this to collaborators impersonating one another, the same boundary as sharing write access, but does not remove it.
+Distinguishing registrants by their matching constraints instead, for example by requiring each user-owned project to pin a distinct workflow file, avoids the parameter but leaves collaborators able to edit each other's workflows.
+
+Because these questions are open, the first phase makes no provision for user-owned projects: it includes neither the ``owner`` column nor a ``username`` exchange parameter.
+Both are easy to add in a later database migration and API revision, and nothing in the admin-owned flow changes when they arrive.
 
 References
 ==========
