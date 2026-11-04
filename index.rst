@@ -33,13 +33,14 @@ The motivating use cases are:
 
 SQuaRE already uses GitHub OIDC tokens in Ook to establish the provenance of documentation uploads, that is, to record which repository and workflow produced an upload.
 This design goes further and uses the ID token for authentication and authorization.
+Once the exchange exists, Ook should move to it as well and accept only Gafaelfawr tokens, so that one mechanism serves both purposes.
 
 The token exchange is implemented directly in Gafaelfawr rather than in a separate broker service.
 Minting tokens for arbitrary bot users requires the ``admin:token`` scope, so a separate broker would itself have to hold a long-lived, highly privileged Gafaelfawr token, reproducing the problem this design is meant to remove.
 Gafaelfawr also already owns the token store, the token change history used for auditing, the admin API conventions, and a deployment in every Phalanx environment, so the registry and the exchange endpoint fit naturally there.
 
 The rest of this technote first explains how OIDC works in the GitHub Actions context, then describes the registry of GitHub projects in Gafaelfawr, the token exchange endpoint, how workflows use it, and the security considerations.
-It closes with the decisions the team needs to make before implementation begins.
+It closes with a sketch of a possible extension to user-owned projects that is not part of this proposal.
 
 How OIDC works in GitHub Actions
 ================================
@@ -227,6 +228,7 @@ The registry is the trust configuration: it says which GitHub workflows may obta
 It is stored in Gafaelfawr's SQL database and managed through a new admin API, so that adding a repository does not require a Phalanx change and deploy.
 Every change to the registry is attributed to the administrator who made it.
 Each Phalanx environment's Gafaelfawr has its own registry, so a repository that needs tokens in two environments, for example Roundtable for Ook and an RSP environment for Noteburst, is registered in both.
+Seeding or mirroring projects across environments from Phalanx values was considered and is not needed; registering a repository in each environment separately is acceptable overhead.
 
 Domain model
 ------------
@@ -311,15 +313,16 @@ Because GitHub's numeric IDs never change or get reused, comparing them at excha
 This copies PyPI's defense against account resurrection and extends it to the repository itself.
 
 The IDs are resolved when a project is created.
-The admin API accepts the repository name, looks up its numeric IDs through GitHub's REST API (``GET /repos/{owner}/{repo}``), and stores them.
-For public repositories this needs no credentials; for private repositories the administrator can supply the IDs explicitly in the request.
-Whether Gafaelfawr should instead hold a GitHub credential for this lookup is listed under open questions.
+The admin API accepts the repository name, looks up its numeric IDs through GitHub's REST API (``GET /repos/{owner}/{repo}``) without credentials, and stores them.
+Only public repositories can therefore be registered in the first phase.
+Support for private repositories, either by accepting the IDs explicitly in the request or by giving Gafaelfawr a GitHub credential for the lookup, can be added later if a use case appears.
+There is in principle a race between the lookup and a rename or transfer of the repository, but an administrator registering a project by hand is unlikely to lose it, and the response echoes the pinned IDs for the administrator to check.
 
 A project may also carry the optional identity attributes that Gafaelfawr's admin token request accepts for service tokens: ``uid``, ``gid``, and ``groups``.
 They matter only where a service resolves the caller's identity through Gafaelfawr's user-info routes and the bot user has no entry in the environment's identity source.
 The services in the motivating use cases authorize on scopes alone, so most projects leave them unset.
 
-Nothing makes ``username`` unique, and sharing a bot user is intended for one case: several projects for the same repository with different policies, such as a project that grants ``read:ook`` on any ref alongside one that grants ``write:docverse`` only on ``main``.
+Nothing makes ``username`` unique, and sharing a bot user is intended for one case: several projects for the same repository with different policies, such as a project that grants ``read:ook`` on pull-request refs (``refs/pull/``) alongside one that grants both ``read:ook`` and ``write:docverse`` on ``refs/heads/main``.
 Both mint tokens for the same bot, and the service sees one identity for that repository.
 Sharing a bot user across repositories is allowed but should be a deliberate choice.
 A service sees only the username, never the GitHub claims, so if two repositories mint as the same bot the service cannot tell them apart or make per-project authorization decisions on the token alone; only the exchange audit log retains the distinction.
@@ -351,10 +354,11 @@ A deploy-style project, for example, should pin the workflow and restrict the re
 Matching is exact rather than pattern-based so that reading a project's configuration is enough to know what it trusts.
 The trailing-slash prefix for refs is the one deliberate exception, because release workflows run on tags whose names cannot be enumerated in advance.
 
-Several projects may match the same token, for example one that constrains only the repository and another that also pins a workflow.
-The exchange chooses the most specific match, defined as the project with the most constraints set.
-If two matching projects tie on specificity, the exchange fails with an error that names both, since the token could legitimately be minted for two different bot users with two different policies.
-The admin API refuses to create a project whose constraints are identical to an existing one, which removes the most common source of such ties.
+At most one project can match a given token, because the admin API refuses to create or modify a project whose constraints overlap those of an existing project for the same repository.
+Two projects overlap when an ID token could satisfy both: for each of ``workflow``, ``environment``, and ``ref``, the constraint is unset in at least one of them, or the two values are equal, or one is a ref prefix of the other.
+An administrator who wants a general policy and a narrower one for the same repository therefore expresses them as disjoint projects, for example one on ``refs/pull/`` and another on ``refs/heads/main``, rather than relying on the exchange to pick the more specific of two matches.
+The rule costs some verbosity but preserves the property that a project's configuration alone says what it trusts; with overlapping projects, a narrower project would silently shadow a broader one.
+The error names the conflicting project so that the administrator can adjust either.
 
 Admin API
 ---------
@@ -371,11 +375,11 @@ Every route requires the ``admin:token`` scope, matching the rule that only toke
    * - ``GET /auth/api/v1/github/projects``
      - List projects; supports ``?repository=`` and ``?username=`` filters
    * - ``POST /auth/api/v1/github/projects``
-     - Create a project; responds with ``201 Created`` and the stored project, including the resolved username and pinned IDs
+     - Create a project; responds with ``201 Created`` and the stored project, including the resolved username and pinned IDs, or with ``409 Conflict`` when its constraints overlap an existing project's
    * - ``GET /auth/api/v1/github/projects/{id}``
      - Retrieve one project
    * - ``PATCH /auth/api/v1/github/projects/{id}``
-     - Modify any field except ``repository_id`` and ``repository_owner_id``; changing ``repository`` re-resolves them, and setting ``enabled`` to false revokes the project's outstanding tokens
+     - Modify any field except ``repository_id`` and ``repository_owner_id``; changing ``repository`` re-resolves them, changing a constraint is checked for overlap as on creation, and setting ``enabled`` to false revokes the project's outstanding tokens
    * - ``DELETE /auth/api/v1/github/projects/{id}``
      - Delete a project and revoke its outstanding tokens; responds with ``204 No Content``
 
@@ -482,8 +486,8 @@ Each failure is logged with the reason and the claims that could be read, so tha
 3. Verify the signature, then check that ``iss`` is ``https://token.actions.githubusercontent.com``, that ``aud`` equals the configured audience, that the current time is not before ``nbf``, allowing a small clock skew, and that it is strictly before ``exp``.
 4. Read the claims the registry needs: ``repository``, ``repository_id``, ``repository_owner_id``, ``job_workflow_ref``, ``ref``, and, if present, ``environment``.
    A token missing any required claim is rejected.
-5. Find the enabled projects for that repository and evaluate the matching rules, selecting the most specific match.
-   No match, or an ambiguous match, is a rejection.
+5. Find the enabled projects for that repository and evaluate the matching rules.
+   No match is a rejection; because the admin API refuses overlapping projects, at most one can match.
 6. Determine the token's scopes and lifetime.
    Requested scopes must be a subset of the project's scopes; a request for a scope outside that set is rejected rather than silently narrowed, so that a misconfigured workflow fails visibly.
    The lifetime is the project's ``max_lifetime``.
@@ -514,7 +518,7 @@ The token change history records the creation with the ``github`` token type, th
 Because the history can be filtered by type through the existing ``token_type`` query parameter on ``/auth/api/v1/history/token-changes``, every token the exchange has ever minted can be listed in one query, and the project ID separates the tokens of projects that share a bot user.
 In addition, the exchange emits a structured log entry and a metrics event carrying the project ID, the bot username, the token key, and the ID token's ``repository``, ``job_workflow_ref``, ``ref``, ``environment``, ``event_name``, ``actor``, ``run_id``, ``run_attempt``, and ``jti``.
 This is enough to answer, for any token, exactly which workflow run obtained it and who triggered that run.
-It also preserves the provenance information that Ook currently derives from the ID token itself.
+It also preserves the provenance information that Ook currently derives by verifying the ID token itself, so Ook can stop doing so and accept only Gafaelfawr tokens: the repository, workflow, and commit an upload came from are supplied in the upload request and attributed to the bot user, and the exchange audit trail ties that bot token to the exact workflow run.
 
 Using the exchange from a workflow
 ==================================
@@ -556,10 +560,9 @@ As a shell step, it looks like this:
 The ``::add-mask::`` line keeps the minted token out of the job log.
 Nothing in the repository's secrets is used.
 
-Writing this shell by hand in every repository is error-prone, so the exchange should be packaged once.
-The proposal is a composite GitHub Action in the ``lsst-sqre`` organization, provisionally ``lsst-sqre/gafaelfawr-token-action``, that takes the Phalanx environment URL and optional scopes as inputs, performs both steps, masks the result, and exposes it as a ``token`` output.
-SQuaRE's existing TypeScript actions that already talk to these services, such as ``docverse-upload``, can also perform the exchange internally using ``@actions/core``'s ``getIDToken()``, so that a workflow needs no separate step at all.
-For Python clients, the ``rubin.gafaelfawr`` client library can gain a helper that performs the exchange when it detects the GitHub Actions environment variables.
+Writing this shell by hand in every repository is error-prone, so the exchange is packaged once as a composite GitHub Action in the ``lsst-sqre`` organization, provisionally ``lsst-sqre/gafaelfawr-token-action``, that takes the Phalanx environment URL and optional scopes as inputs, performs both steps, masks the result, and exposes it as a ``token`` output.
+This action is the first deliverable, and SQuaRE's existing actions that talk to these services, such as ``docverse-upload``, are used alongside it: a workflow runs the token action and passes its output to the service action, as in the example above.
+Building the exchange into those actions directly with ``@actions/core``'s ``getIDToken()``, and adding a helper to the ``rubin.gafaelfawr`` client library that performs the exchange when it detects the GitHub Actions environment variables, can follow once the action has proven the interface.
 
 Whichever packaging is used, the audience must be the exact base URL of the Phalanx environment, because Gafaelfawr in each environment accepts only its own audience.
 A workflow that talks to services in two environments requests two ID tokens and performs two exchanges.
@@ -610,7 +613,7 @@ Replay
 ------
 
 A GitHub ID token is valid for minutes and the exchange is idempotent in effect: replaying one yields another token for the same bot user under the same policy, which the holder of the first token could already use.
-Recording the ``jti`` of exchanged tokens in Redis until their ``exp`` would make each ID token single-use at low cost; whether this is worth doing is an open question.
+Recording the ``jti`` of exchanged tokens in Redis until their ``exp`` would make each ID token single-use, but since a replay gains nothing that the first exchange did not already grant, and the window is minutes long, this design relies on the ID token's short validity and does not track ``jti``.
 
 Renames and resurrection
 ------------------------
@@ -629,7 +632,8 @@ Scope limits
 ------------
 
 The registry refuses ``admin:token`` and the other reserved ``admin:`` scopes, so no workflow can obtain token-administrator powers.
-Gafaelfawr could additionally restrict registrable scopes to a configured allowlist per environment; this is listed as an open question.
+A per-environment allowlist of registrable scopes was considered and is not proposed: the registry's own scope list, which only token administrators can set, is the control.
+Gafaelfawr's model of scopes and delegation is expected to be reworked in future, and any further restriction belongs with that work.
 
 Key handling
 ------------
@@ -693,36 +697,6 @@ Verifying that the user controls the repository is hard to do well when the plat
 
 To keep this phase additive, the first phase should include the nullable ``owner`` column in the project table and accept an optional ``username`` parameter on the exchange request, ignored when no user-owned projects exist.
 Everything else, the user-facing routes, the UI, the group lookup at exchange time, and the environment setting, can be added later without changing the admin-owned flow.
-
-Open questions and decisions for review
-=======================================
-
-The following decisions need to be made before implementation starts.
-None changes the external interface, which review has settled on the RFC 8693 token exchange grammar; each can be settled during review or deferred with a recorded default.
-
-- **Resolving pinned IDs.**
-  Should the admin API look up ``repository_id`` and ``repository_owner_id`` through GitHub's public API, require administrators to supply them, or should Gafaelfawr hold a GitHub credential so private repositories can be resolved too?
-- **Overlapping projects.**
-  Is most-specific-match-wins with an error on ties acceptable, or should the admin API refuse any new project whose constraints overlap an existing one?
-- **Event constraints.**
-  Should a project be able to restrict ``event_name`` (for example to exclude ``pull_request``), or is the ref restriction sufficient?
-- **Replay protection.**
-  Record exchanged ``jti`` values in Redis to make each ID token single-use, or rely on the ID token's short validity?
-- **Registrable scopes.**
-  Beyond refusing ``admin:`` scopes, should each environment configure an allowlist of scopes that GitHub projects may be granted?
-- **Ref matching.**
-  Is the trailing-slash prefix form enough, or do any use cases need glob patterns on refs?
-- **Ook's provenance.**
-  Should Ook keep verifying ID tokens itself for provenance, or rely on the audit trail Gafaelfawr records at exchange time and accept only Gafaelfawr tokens?
-- **Client packaging.**
-  A standalone composite action, exchange built into individual SQuaRE actions (like `lsst-sqre/docverse-upload <https://github.com/lsst-sqre/docverse-upload>`__), a ``rubin.gafaelfawr`` helper, or all three?
-- **Default lifetimes.**
-  Are 1 hour per project and a 6 hour environment ceiling the right defaults?
-- **Multiple environments.**
-  Registries are per environment.
-  Is registering a repository in each environment acceptable operational overhead, or should Phalanx values seed or mirror projects across environments?
-- **Room for user-owned projects.**
-  Include the nullable ``owner`` column and the optional ``username`` exchange parameter in the first phase, as :ref:`user-owned-projects` section prposes, or defer both?
 
 References
 ==========
