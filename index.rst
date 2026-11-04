@@ -572,15 +572,33 @@ Anyone who can get a workflow to run in that repository on a matching workflow, 
 This is the same boundary PyPI accepts, and it is a better one than a stored secret, which anyone with access to the repository's settings can read and use from anywhere.
 Administrators tighten the boundary with the registry constraints: pinning the workflow file, restricting the ref to the default branch or release tags, and, where review before use is wanted, requiring a GitHub environment, since environments can be configured with required reviewers and deployment branch rules.
 
+GitHub environments
+-------------------
+
+A GitHub environment is a named deployment target in a repository that can carry protection rules: required reviewers, a wait timer, and a rule restricting which branches and tags may deploy to it.
+A job that declares an ``environment`` cannot start until those rules are satisfied, and only then does its ID token carry the ``environment`` claim.
+Pinning ``environment`` on a project therefore delegates part of the authorization decision to GitHub: a token for that project can be minted only by a job that passed the environment's rules.
+A job that declares no environment has no ``environment`` claim, so a project that pins one never matches it; the constraint cannot be bypassed by omission.
+PyPI makes the environment optional but strongly recommends it, and this design takes the same position.
+It is not required, because several motivating use cases, such as link checking on every push, have no deployment step and nothing for a reviewer to approve.
+For projects with write scopes, administrators should prefer an environment over a bare ref constraint where the repository's maintainers will configure one: the deployment branch rule gives the same ref restriction, and required reviewers add a human gate that no claim constraint can express.
+
 Pull requests and forks
 -----------------------
 
-GitHub does not issue ID tokens to workflows triggered by pull requests from forks, and the ``repository`` claim always names the base repository, never the fork.
-A ``pull_request`` run from a branch within the repository does get a token, with ``ref`` set to the merge ref and ``event_name`` set to ``pull_request``.
-A project with no workflow or ref constraint therefore grants its scopes to pull-request builds of the same repository.
-For read-only scopes such as link checking this is intended; for write scopes the ref should be constrained.
-Workflows using ``pull_request_target`` run with the base repository's permissions against untrusted code and should never be registered with write scopes.
-The implementation should verify the fork behaviour against current GitHub documentation.
+GitHub runs a workflow for a pull request under one of two events, and they differ in what an ID token attests.
+A ``pull_request`` event runs the workflow file from the pull request's head.
+When the pull request comes from a fork, GitHub downgrades every write permission of the job to read, including ``id-token: write``, so such a run cannot obtain an ID token at all.
+A ``pull_request`` run from a branch within the repository keeps its permissions and does get a token, with ``event_name`` set to ``pull_request`` and ``ref`` set to the merge ref, ``refs/pull/<number>/merge``.
+A ``pull_request_target`` event instead runs the workflow file from the base branch with the base repository's full permissions, even for a pull request from a fork, and its ``ref`` claim is the base branch, such as ``refs/heads/main``.
+Such a run does obtain an ID token, and a ``ref`` constraint on the default branch does not exclude it.
+
+The ``repository`` claim always names the base repository, never a fork, so a fork cannot match a project on its own.
+The hazard is a registered workflow that uses ``pull_request_target`` and then checks out and executes the pull request's code: it runs untrusted code under the base repository's identity and can obtain the project's token.
+This is the same hazard that ``pull_request_target`` poses for repository secrets, and the defense is the same.
+Workflows that use ``pull_request_target`` must not run code from the pull request, and projects with write scopes should pin the workflow file so that only workflows the maintainers control can mint tokens.
+A project with no workflow or ref constraint grants its scopes to same-repository ``pull_request`` builds, which is intended for read-only scopes such as link checking; for write scopes both the workflow and the ref should be constrained.
+An ``event_name`` constraint would exclude pull-request events outright and is the natural extension if pinning the workflow proves insufficient.
 
 Audience confusion
 ------------------
@@ -700,8 +718,6 @@ None changes the external interface, which review has settled on the RFC 8693 to
   A standalone composite action, exchange built into individual SQuaRE actions (like `lsst-sqre/docverse-upload <https://github.com/lsst-sqre/docverse-upload>`__), a ``rubin.gafaelfawr`` helper, or all three?
 - **Default lifetimes.**
   Are 1 hour per project and a 6 hour environment ceiling the right defaults?
-- **Fork and pull-request behaviour.**
-  Confirm against current GitHub documentation that pull requests from forks receive no ID token and how ``ref`` is set for ``pull_request`` runs, and confirm the 6 hour job limit assumed for the lifetime ceiling.
 - **Multiple environments.**
   Registries are per environment.
   Is registering a repository in each environment acceptable operational overhead, or should Phalanx values seed or mirror projects across environments?
