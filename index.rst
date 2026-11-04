@@ -388,12 +388,12 @@ A request to create a project for Docverse uploads from the SQR-062 repository, 
 .. code-block:: json
 
    {
-     "description": "Docverse uploads for SQR-062",
+     "description": "Documentation builds for SQR-062",
      "username": "bot-gh-docverse-sqr-062",
      "repository": "lsst-sqre/sqr-062",
      "workflow": ".github/workflows/docs.yaml",
      "ref": "refs/heads/main",
-     "scopes": ["write:docverse"],
+     "scopes": ["write:docverse", "exec:linkcheck", "write:intersphinx"],
      "max_lifetime": "PT1H"
    }
 
@@ -440,7 +440,7 @@ The request is form-encoded, as for every OAuth 2.0 token endpoint:
    grant_type=urn:ietf:params:oauth:grant-type:token-exchange
    &subject_token=eyJhbGciOiJSUzI1NiIs...
    &subject_token_type=urn:ietf:params:oauth:token-type:id_token
-   &scope=write:docverse
+   &scope=write:docverse exec:linkcheck write:intersphinx
 
 ``grant_type`` and ``subject_token_type`` must have exactly the values shown; any other value is rejected.
 ``subject_token`` is the GitHub ID token.
@@ -458,7 +458,7 @@ A successful response is ``200 OK`` and follows RFC 6749 and RFC 8693:
      "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
      "token_type": "Bearer",
      "expires_in": 3600,
-     "scope": "write:docverse"
+     "scope": "write:docverse exec:linkcheck write:intersphinx"
    }
 
 ``access_token`` is the Gafaelfawr token, ``expires_in`` is its remaining lifetime in seconds, and ``scope`` is the space-separated list of scopes it carries.
