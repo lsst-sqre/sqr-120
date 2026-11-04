@@ -6,6 +6,7 @@ GitHub Actions OIDC token exchange in Gafaelfawr
 
    This technote proposes a design for authenticating GitHub Actions workflows to Phalanx-deployed services without long-lived secrets.
    A workflow presents the OpenID Connect (OIDC) ID token that GitHub issues to its job, and Gafaelfawr exchanges it for a short-lived Gafaelfawr token of a new ``github`` type whose scopes and lifetime are set by a registry of trusted GitHub projects.
+   Administrators manage the registry through an admin API, and a narrower provisioning scope lets Templatebot register projects for newly created technotes from administrator-defined templates.
 
 Introduction
 ============
@@ -39,7 +40,7 @@ The token exchange is implemented directly in Gafaelfawr rather than in a separa
 Minting tokens for arbitrary bot users requires the ``admin:token`` scope, so a separate broker would itself have to hold a long-lived, highly privileged Gafaelfawr token, reproducing the problem this design is meant to remove.
 Gafaelfawr also already owns the token store, the token change history used for auditing, the admin API conventions, and a deployment in every Phalanx environment, so the registry and the exchange endpoint fit naturally there.
 
-The rest of this technote first explains how OIDC works in the GitHub Actions context, then describes the registry of GitHub projects in Gafaelfawr, the token exchange endpoint, how workflows use it, and the security considerations.
+The rest of this technote first explains how OIDC works in the GitHub Actions context, then describes the registry of GitHub projects in Gafaelfawr, the token exchange endpoint, how workflows use it, how Templatebot provisions projects for new technotes, and the security considerations.
 It closes with a sketch of a possible extension to user-owned projects that is not part of this proposal.
 
 How OIDC works in GitHub Actions
@@ -252,10 +253,18 @@ In the table, the Required column distinguishes fields the administrator must su
      - integer
      - generated
      - Primary key; the project's only identifier, used in admin API URLs, the exchange response, and audit logs
+   * - ``template``
+     - string
+     - generated
+     - Name of the project template the project was provisioned from, or null for projects created directly through the admin API; see :ref:`provisioning`
    * - ``description``
      - string
      - no
      - Free text for administrators
+   * - ``requested_by``
+     - string
+     - no
+     - Opaque identifier of the person on whose behalf the project was created, as ``<source>:<identifier>``, such as ``slack:U024BE7LH`` or ``gafaelfawr:jsick``; recorded in the history and filterable, never interpreted
    * - ``username``
      - string
      - default
@@ -305,7 +314,9 @@ In the table, the Required column distinguishes fields the administrator must su
    * - ``created_by``, ``modified_by``
      - string
      - generated
-     - Username of the administrator who made the change
+     - Username from the token that authenticated the request, whether an administrator's or a provisioner's; never taken from the request body
+
+.. _pinned-ids:
 
 The two pinned fields are what make the registry robust against GitHub-side changes.
 A repository can be renamed or transferred, and an organization or user name can be deleted and later re-registered by someone else.
@@ -365,6 +376,7 @@ Admin API
 
 The registry is managed through a resource collection at ``/auth/api/v1/github/projects``.
 Every route requires the ``admin:token`` scope, matching the rule that only token administrators may create service tokens for arbitrary bot users.
+A second collection of project templates, and a provisioning route that creates a project from a template under a narrower scope, are described in :ref:`provisioning`.
 
 .. list-table:: Admin API routes
    :header-rows: 1
@@ -373,7 +385,7 @@ Every route requires the ``admin:token`` scope, matching the rule that only toke
    * - Method and path
      - Purpose
    * - ``GET /auth/api/v1/github/projects``
-     - List projects; supports ``?repository=`` and ``?username=`` filters
+     - List projects; supports ``?repository=``, ``?username=``, ``?template=``, and ``?requested_by=`` filters
    * - ``POST /auth/api/v1/github/projects``
      - Create a project; responds with ``201 Created`` and the stored project, including the resolved username and pinned IDs, or with ``409 Conflict`` when its constraints overlap an existing project's
    * - ``GET /auth/api/v1/github/projects/{id}``
@@ -567,6 +579,185 @@ Building the exchange into those actions directly with ``@actions/core``'s ``get
 Whichever packaging is used, the audience must be the exact base URL of the Phalanx environment, because Gafaelfawr in each environment accepts only its own audience.
 A workflow that talks to services in two environments requests two ID tokens and performs two exchanges.
 
+.. _provisioning:
+
+Automated provisioning of projects
+==================================
+
+Most projects in the registry will be technotes, and technotes are not created by hand.
+An author asks for one in Slack; `Squarebot <https://github.com/lsst-sqre/squarebot>`__ publishes the request to a Kafka topic; and `Templatebot <https://github.com/lsst-sqre/templatebot>`__, a service deployed in Roundtable, consumes the request, creates the GitHub repository from the technote template, and registers the new document with Docverse.
+For the new repository's first documentation build to succeed, Templatebot must also create its project in Gafaelfawr's registry as part of the same step.
+This section describes how Templatebot is given that ability without giving it the powers of a token administrator.
+
+Why not ``admin:token``
+-----------------------
+
+The registry's admin API requires ``admin:token`` because a project is a standing authorization to mint tokens for a chosen bot user with chosen scopes, which is the power that scope already guards.
+Templatebot could hold a service token with ``admin:token``, as Noteburst does today, and call the admin API directly.
+But that scope lets its holder view, create, modify, and delete every token in the environment, so a compromise of Templatebot, or of the Kafka topic it consumes, would become a compromise of every identity in Roundtable.
+Templatebot needs a far narrower power.
+It only ever creates projects of one shape: for a repository it has just created, under one of a handful of GitHub organizations, with the same workflow, ref, scopes, and lifetime every time.
+The registry should let an administrator express that shape once and let Templatebot supply only the repository.
+
+Project templates
+-----------------
+
+A project template is a registry resource that fixes every field of a project except the repository.
+Templates are created and modified only by token administrators, through routes under ``/auth/api/v1/github/project-templates`` that require ``admin:token``, and changes to them are recorded in the project history table alongside changes to projects.
+Templates could instead be Helm values in Phalanx, which would give them pull-request review, but keeping them in the registry gives trust configuration one audit history and one API, and lets a template change without a Gafaelfawr deploy.
+A template's ``name`` is immutable, and a template cannot be deleted while any project records it: the request fails with ``409 Conflict`` and the number of projects, so that the ``template`` field on projects always names a template that exists and the ``?template=`` filter cannot be made to lie by deleting a template and creating another with the same name.
+A template whose projects should remain is retired by disabling it.
+
+.. list-table:: Fields of a project template
+   :header-rows: 1
+   :widths: 20 12 10 58
+
+   * - Field
+     - Type
+     - Required
+     - Description
+   * - ``name``
+     - string
+     - yes
+     - Identifier, a short slug such as ``technote``; unique, used in URLs and by provisioners
+   * - ``description``
+     - string
+     - no
+     - Free text for administrators
+   * - ``owners``
+     - list of strings
+     - yes
+     - GitHub owners (organizations or users) whose repositories may be provisioned from this template; each is resolved to its numeric ID through GitHub's REST API (``GET /users/{owner}``) when the template is created or modified and pinned alongside the name
+   * - ``repository_pattern``
+     - string
+     - no
+     - Regular expression the repository name, without the owner, must match, such as ``^[a-z]+-[0-9]{3,}$`` for technote series; unset matches any name
+   * - ``workflow``, ``environment``, ``ref``
+     - as for projects
+     - no
+     - Constraints copied into every project provisioned from the template
+   * - ``scopes``, ``max_lifetime``, ``uid``, ``gid``, ``groups``
+     - as for projects
+     - as for projects
+     - Policy copied into every project provisioned from the template; the same scope restrictions apply
+   * - ``enabled``
+     - boolean
+     - yes
+     - Disabled templates cannot be used to provision; projects already provisioned from them are unaffected
+   * - ``created``, ``modified``, ``created_by``, ``modified_by``
+     - as for projects
+     - generated
+     - Audit metadata
+
+The template for technotes pins the reusable workflow that every technote repository calls, leaves ``ref`` unset because Docverse publishes an edition for every branch and pull request, and grants the documentation scopes.
+Its owners are the GitHub organizations of the technote series offered by the `technote templates <https://github.com/lsst/templates/blob/main/project_templates/technote_rst/templatekit.yaml>`__ in lsst/templates, including the ``lsst-sqre-testing`` organization that test technotes are created in, so that test runs of Templatebot exercise provisioning too:
+
+.. code-block:: json
+
+   {
+     "name": "technote",
+     "description": "Documentation builds for technotes created by Templatebot",
+     "owners": ["lsst-dm", "lsst", "lsst-it", "lsst-pst", "lsst-sims", "lsst-so", "lsst-sqre", "lsst-tstn", "lsst-sqre-testing"],
+     "repository_pattern": "^[a-z]+-[0-9]{3,}$",
+     "workflow": "lsst-sqre/rubin-sphinx-technote-workflows/.github/workflows/ci.yaml",
+     "scopes": ["write:docverse", "exec:linkcheck", "write:intersphinx"],
+     "max_lifetime": "PT1H"
+   }
+
+:ref:`The pinned owner IDs <pinned-ids>` extend the registry's defense against resurrection to the template: if an organization in the list is deleted and its name re-registered by someone else, repositories under the new organization fail the owner check even though the name still matches.
+
+Provisioning a project
+----------------------
+
+A provisioner creates a project from a template with a single request that names the template and supplies the repository, with an optional ``requested_by`` and ``description``:
+
+.. code-block:: text
+
+   POST /auth/api/v1/github/project-templates/technote/projects
+
+.. code-block:: json
+
+   {
+     "repository": "lsst-sqre/sqr-120",
+     "requested_by": "slack:U024BE7LH",
+     "description": "Created by Templatebot for Jonathan Sick, Slack request at 2026-11-04T18:02:11Z"
+   }
+
+Gafaelfawr checks that the template is enabled, looks up the repository through GitHub's REST API as the admin API does, and checks that the repository's owner is in the template's ``owners`` list by name and by pinned ID, and that the repository name matches ``repository_pattern`` if the template has one.
+It then creates the project exactly as the admin API would from a request carrying the template's fields and the supplied repository: the username is derived as ``bot-gh-<owner>-<repo>`` and may not be chosen, the repository IDs are pinned, overlap with existing projects is checked, and ``created_by`` and the history's actor are set from the token that authenticated the request, so a provisioner cannot claim to be anyone but itself.
+The project records the template's name in a new nullable ``template`` field, so that administrators can list what a template has produced with the ``?template=`` filter on the project list route.
+The response is the same ``201 Created`` document the admin route returns.
+
+The template's fields are copied into the project rather than referenced from it.
+A provisioned project is therefore a complete, self-describing project: the matching rules, the overlap rule, and the statement that a project's configuration alone says what it trusts are all unchanged.
+The cost is that editing a template changes only projects provisioned afterwards.
+A fleet-wide change, such as a new path for the reusable workflow, is applied by an administrator with a script that lists the template's projects and patches each one.
+That is the right place for it: such a change alters what every technote repository is trusted to do, and it should be made by a token administrator, not inherited silently from a template edit.
+
+The route is idempotent, because Templatebot consumes Kafka with at-least-once delivery and its project creation runs as a sequence of steps that may be retried after a failure.
+When a project for the same repository already exists and records the same template, the route returns it with ``200 OK`` instead of creating a duplicate or failing with ``409 Conflict``.
+A project for the same repository that was created by hand, or from a different template, conflicts as usual, and Templatebot reports the conflict in Slack rather than guessing which policy was intended.
+
+A provisioner cannot choose a username, scopes, constraints, or lifetime, and it cannot modify or delete projects or read the templates' policy beyond what the created project echoes.
+The most it can do is extend a policy an administrator wrote to a repository an administrator allowed.
+
+The provisioning scope
+----------------------
+
+The provisioning route is authorized by a new scope, provisionally ``admin:github-oidc-provision``, in the namespace Gafaelfawr reserves for its own use.
+The scope grants exactly one capability, creating a project from a template, and no other registry route; ``admin:token`` also satisfies the route, since token administrators can do everything a provisioner can.
+Because the scope begins with ``admin:``, the registry refuses it on projects and templates, as it refuses every reserved scope.
+No GitHub workflow can therefore obtain a token that provisions projects, which closes a loop that would otherwise let a workflow extend trust to new repositories.
+
+Templatebot's service token is a ``GafaelfawrServiceToken`` resource in its Phalanx chart, for the bot user ``bot-templatebot`` with the ``admin:github-oidc-provision`` scope and whatever scope Docverse requires for registering documents.
+Templatebot will need such a token anyway as Docverse replaces the LSST the Docs administrator password that Templatebot currently holds.
+Gafaelfawr's Kubernetes operator creates the token, stores it in a secret in Templatebot's namespace, and rotates it; no human handles it, and it is valid only in the Roundtable environment.
+
+What a compromise of that token yields is bounded by the template.
+An attacker holding it can register, for any repository under the template's owners whose name matches its pattern, a project granting the template's scopes to that repository's own bot user, and still needs write access to such a repository to mint a token.
+Templatebot's GitHub App credential already allows creating and pushing to repositories in those same organizations, and every technote repository is meant to carry this policy, so the marginal exposure is a non-technote repository with a technote-shaped name receiving documentation-grade scopes.
+An administrator who finds such a project disables it, which revokes its tokens, and can find everything a provisioner made with the ``?template=`` filter and the ``created_by`` field.
+
+The person who asked for the technote is not the actor in the registry's audit fields; Templatebot is.
+That is deliberate: ``created_by`` names the principal whose token Gafaelfawr verified, which is the identity accountable for the request and the one an administrator filters on to find everything a provisioner did, whereas the requester is a claim the provisioner makes that Gafaelfawr has no way to check.
+To keep the human cause of each project visible, the provisioning request carries an optional ``requested_by`` field, stored on the project and in its history row and exposed as a filter on the project list route.
+Gafaelfawr treats the value as an opaque string and never resolves or validates it, because the registry cannot know how requests reach a provisioner.
+Today they arrive from Slack, where the requester is a Slack user ID; a future provisioner might be an MCP server whose callers are authenticated by Gafaelfawr itself, so the requester would be a Roundtable username.
+The provisioner therefore says what kind of identifier it is sending, by the convention ``<source>:<identifier>``: ``slack:U024BE7LH`` from Templatebot, ``gafaelfawr:jsick`` from a service behind Gafaelfawr's ingress, or another prefix for a source that does not exist yet, with no change to Gafaelfawr.
+Stable identifiers are preferred over display names, since a Slack handle can change while the user ID cannot; the provisioner may put the display name in ``description`` for readers, as in the example above.
+The provisioner's own logs tie the request it received to the project it created.
+Authorizing who may create a technote at all remains the concern of whatever system accepts the request, Slack and Squarebot today, and this design does not change it.
+
+Order of operations and other environments
+------------------------------------------
+
+Templatebot should provision the Gafaelfawr project after it creates the repository on GitHub and before it pushes the initial commit, because the push triggers the first workflow run and that run must already find its project.
+The GitHub lookup that pins the repository IDs succeeds on an empty repository.
+Templatebot also compares the pinned IDs echoed in the response with the IDs GitHub returned when it created the repository, which closes mechanically the lookup race the admin API leaves to an administrator's eye.
+
+Like the registry, the provisioning route exists per Phalanx environment, and a Phalanx-managed service token is valid only in the environment whose Gafaelfawr issued it.
+Templatebot's token is issued by Roundtable, where Docverse and Ook run, so documentation projects can be provisioned there.
+Notebook technotes additionally need a project in a Rubin Science Platform environment for Noteburst, and Templatebot has no token in those environments.
+In the first phase those projects are registered by hand, which is acceptable for the small number of notebook technotes.
+If that becomes a burden, an administrator can issue Templatebot a service token in the RSP environment carrying only ``admin:github-oidc-provision`` and store it in Templatebot's Vault secrets.
+The narrow scope makes that a tolerable long-lived secret in a way that an ``admin:token`` service token would not be.
+
+Alternatives considered
+-----------------------
+
+Organization-wide projects, whose ``repository`` is a pattern such as ``lsst-sqre/*`` with the bot username derived per repository at exchange time, would remove the need for provisioning altogether.
+They are rejected because they change the trust boundary from write access to a registered repository to write access to any repository in the organization, and there are hundreds.
+They also move per-repository authorization into the services: Docverse would have to check that the bot username matches the document being uploaded, whereas the services in this design authorize on scopes alone.
+Finally, they give up the property that a project's configuration says what it trusts and that a single repository can be disabled.
+A template offers the same economy of configuration while keeping the per-repository grain.
+
+Trust on first use, in which Gafaelfawr creates a project automatically when an unknown repository under an allowed owner presents an ID token, has the same problems and a worse one: registration would be triggered by the party being registered.
+
+A per-template list of the usernames allowed to provision from it, in addition to the scope, would let an administrator bind each template to one service.
+It is not proposed because there is one template and one provisioner, and the scope alone is the simpler statement; the field is easy to add if a second provisioner appears.
+
+Asking an administrator to approve each provisioning request in Slack would reintroduce the manual step that automating technote creation exists to remove.
+
 Security considerations
 =======================
 
@@ -631,9 +822,17 @@ This is a documentation point for workflow authors and a reason the exchange log
 Scope limits
 ------------
 
-The registry refuses ``admin:token`` and the other reserved ``admin:`` scopes, so no workflow can obtain token-administrator powers.
+The registry refuses ``admin:token`` and the other reserved ``admin:`` scopes, so no workflow can obtain token-administrator powers or, through ``admin:github-oidc-provision``, the power to register further repositories.
 A per-environment allowlist of registrable scopes was considered and is not proposed: the registry's own scope list, which only token administrators can set, is the control.
 Gafaelfawr's model of scopes and delegation is expected to be reworked in future, and any further restriction belongs with that work.
+
+Automated provisioning
+----------------------
+
+Templatebot's provisioning token is the one long-lived credential this design adds, and it is held by a service in the cluster rather than in a GitHub repository.
+Its scope cannot mint tokens, read or modify existing projects, or choose a username, scopes, or constraints; it can only instantiate a template for a repository under an owner the template allows.
+The exposure from its compromise is therefore the template's policy applied to a repository that should not have had it, and it is found with the project list's ``?template=`` filter and cut off by disabling the project.
+This is the trade the design makes: a narrow, bounded power for Templatebot in exchange for never handling ``admin:token`` outside Gafaelfawr's administrators.
 
 Key handling
 ------------
