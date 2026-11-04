@@ -424,7 +424,8 @@ Configuration
 -------------
 
 The feature is enabled per Phalanx environment through Gafaelfawr's Helm values.
-The proposed settings, under a new ``config.github.tokenExchange`` block, are ``enabled`` (default ``false``), ``audience`` (default: Gafaelfawr's base URL), ``maxLifetime`` (the ceiling for any project's ``max_lifetime``, default 6 hours to match the longest a GitHub-hosted job can run), and ``jwksCacheLifetime`` (how long GitHub's signing keys are cached, default 1 hour).
+The proposed settings, under a new top-level ``config.githubTokenExchange`` block, are ``enabled`` (default ``false``), ``audience`` (default: Gafaelfawr's base URL), ``maxLifetime`` (the ceiling for any project's ``max_lifetime``, default 6 hours to match the longest a GitHub-hosted job can run), and ``jwksCacheLifetime`` (how long GitHub's signing keys are cached, default 1 hour).
+The block is deliberately not nested under ``config.github``: that block configures GitHub as the authentication provider and cannot be set alongside CILogon or OpenID Connect authentication, whereas the token exchange must also run in Science Platform environments that authenticate through CILogon, such as those where Noteburst executes notebook technotes.
 The issuer is fixed to ``https://token.actions.githubusercontent.com`` and is not configurable, since GitHub Enterprise Server is not in scope.
 
 The token exchange endpoint
@@ -432,7 +433,7 @@ The token exchange endpoint
 
 The exchange endpoint is the only new route a workflow calls.
 It is unauthenticated in Gafaelfawr's usual sense: no Gafaelfawr token is presented, because the GitHub ID token is the credential.
-It is served directly by Gafaelfawr, like the rest of ``/auth/api/v1``, and is enabled only when ``config.github.tokenExchange.enabled`` is true.
+It is served directly by Gafaelfawr, like the rest of ``/auth/api/v1``, and is enabled only when ``config.githubTokenExchange.enabled`` is true.
 
 The endpoint lives at ``POST /auth/api/v1/github/token`` and follows the OAuth 2.0 token exchange grammar of RFC 8693.
 Gafaelfawr already uses standard interfaces where it talks to third-party software, and this endpoint is consumed by GitHub-hosted tooling rather than by Gafaelfawr's own clients, so the standard grammar is preferred over a Gafaelfawr-specific JSON shape.
@@ -479,7 +480,9 @@ As RFC 6749 requires, the response is sent with ``Cache-Control: no-store``.
 
 Errors use the OAuth 2.0 error document with HTTP 400: ``invalid_request`` for a malformed request, including an unsupported ``grant_type`` or ``subject_token_type``; ``invalid_grant`` for an ID token that fails verification or matches no enabled project; and ``invalid_scope`` for a scope the project does not allow.
 Each carries an ``error_description`` with a human-readable reason that a workflow author can act on.
-Gafaelfawr's OpenID Connect server already implements this error document for its own token endpoint, so the error handling can be shared.
+The description names the check that failed and the values from the caller's own ID token, such as the audience the token carried or the repository, workflow, and ref that matched no project, since GitHub minted the token for the caller and those values are already theirs to read.
+It never describes registry entries that did not match, such as the constraints of a project for the same repository, so that the endpoint cannot be used to probe what the registry trusts.
+Gafaelfawr's OpenID Connect server already implements this error document for its own token endpoint, so the response format can be shared; its ``invalid_grant`` errors, however, deliberately hide their details because an authorization code is a secret worth defending against probing, so the exchange uses its own error classes rather than reusing that behavior.
 
 The alternative considered was a JSON request and response in the style of PyPI's mint-token endpoint and the rest of Gafaelfawr's ``/auth/api/v1`` routes: a body of ``{"token": "<jwt>", "scopes": [...]}`` answered with ``201 Created`` and a document carrying the token, the bot username, the scopes, the expiration time, and the matched project ID, with errors in Gafaelfawr's ``detail`` format.
 Its advantages were consistency with the rest of the API and a response that could echo the resolved identity.
