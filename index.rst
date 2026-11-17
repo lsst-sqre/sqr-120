@@ -298,7 +298,7 @@ In the table, the Required column distinguishes fields the administrator must su
    * - ``scopes``
      - list of strings
      - yes
-     - Maximum scopes a minted token may carry; each must be a known scope and may not be ``admin:token`` or another reserved ``admin:`` scope
+     - Maximum scopes a minted token may carry; each must be a known scope and may not be ``admin:token`` or another reserved ``admin:`` scope, nor ``user:token`` or another ``user:`` scope, since a token that could create user tokens would escape the project's maximum lifetime
    * - ``max_lifetime``
      - duration
      - yes
