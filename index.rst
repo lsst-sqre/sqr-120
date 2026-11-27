@@ -298,7 +298,7 @@ In the table, the Required column distinguishes fields the administrator must su
    * - ``scopes``
      - list of strings
      - yes
-     - Maximum scopes a minted token may carry; each must be a known scope and may not be ``admin:token`` or another reserved ``admin:`` scope
+     - Maximum scopes a minted token may carry; each must be a known scope and may not be ``admin:token`` or another reserved ``admin:`` scope, nor ``user:token`` or another ``user:`` scope, since a token that could create user tokens would escape the project's maximum lifetime
    * - ``max_lifetime``
      - duration
      - yes
@@ -498,7 +498,7 @@ Each failure is logged with the reason and the claims that could be read, so tha
    Reject anything but an asymmetric algorithm GitHub uses (``RS256``).
 2. Load GitHub's JWKS from the URL in its OpenID configuration document, from a cache with the configured lifetime.
    If ``kid`` is not in the cached set, refresh the cache once before failing, since GitHub rotates keys.
-3. Verify the signature, then check that ``iss`` is ``https://token.actions.githubusercontent.com``, that ``aud`` equals the configured audience, that the current time is not before ``nbf``, allowing a small clock skew, and that it is strictly before ``exp``.
+3. Verify the signature, then check that ``iss`` is ``https://token.actions.githubusercontent.com``, that ``aud`` equals the configured audience, and that the current time is not before ``nbf`` and is before ``exp``, allowing the same small clock skew for both.
 4. Read the claims the registry needs: ``repository``, ``repository_id``, ``repository_owner_id``, ``job_workflow_ref``, ``ref``, and, if present, ``environment``.
    A token missing any required claim is rejected.
 5. Find the enabled projects for that repository and evaluate the matching rules.
